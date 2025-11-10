@@ -71,8 +71,9 @@ cron.schedule('*0 1 * * *', () => {
     runJob(null).catch(err => {
         console.error('[CRON ERROR] Job tự động thất bại:', err);
     });
+},{
+    timezone: "Asia/Ho_Chi_Minh"
 });
-console.log('[SERVER] Đã lập lịch Job chạy mỗi 1h.');
 // --- 5. API ENDPOINTS ---
 /**
  * API CHO NGƯỜI DÙNG: Lấy điểm an toàn đã tính toán
