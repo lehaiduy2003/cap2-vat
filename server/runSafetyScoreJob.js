@@ -53,6 +53,11 @@ async function calculateUserScore(propertyId, client) {
             return 5.0; // Điểm trung lập
         }
         const avgRating = parseFloat(res.rows[0].avg_rating);
+        // Thêm bước kiểm tra NaN để phòng trường hợp giá trị từ DB không hợp lệ
+        if (isNaN(avgRating)) {
+            console.warn(`[WARN JOB] P_ID ${propertyId}: avg_rating trả về NaN. Giá trị gốc: ${res.rows[0].avg_rating}. Trả về điểm trung lập.`);
+            return 5.0; // Điểm trung lập
+        }
         return avgRating * 2.0; // Chuẩn hóa 1-5 sao -> 0-10 điểm
     } catch (err) {
         console.error(`[LỖI JOB] calculateUserScore P_ID ${propertyId}: ${err.message}`);
@@ -127,7 +132,13 @@ async function calculateEnvScore(property, client) {
         let totalWeightScore = 0;
 
         if (res.rows.length > 0 && res.rows[0].total_weight_score !== null) {
-            totalWeightScore = parseFloat(res.rows[0].total_weight_score);
+            const parsedScore = parseFloat(res.rows[0].total_weight_score);
+            if (isNaN(parsedScore)) {
+                console.warn(`[WARN JOB] P_ID ${property.id}: total_weight_score trả về NaN. Giá trị gốc: ${res.rows[0].total_weight_score}. Sử dụng giá trị 0.`);
+                totalWeightScore = 0;
+            } else {
+                totalWeightScore = parsedScore;
+            }
         }
         
         const finalScore = ENV_BASE_SCORE + totalWeightScore;
@@ -185,9 +196,9 @@ async function runJob(targetPropertyId = null) {
             const envScore = await calculateEnvScore(prop, client);
 
             // 3. Xử lý lỗi (Rất quan trọng)
-            // Nếu 1 trong 3 hàm con bị lỗi, bỏ qua phòng này
-            if (userScore === null || crimeScore === null || envScore === null) {
-                console.warn(`-> [BỎ QUA] P_ID ${prop.id} do không thể tính toán đủ 3 thành phần điểm.`);
+            // Nếu 1 trong 3 hàm con bị lỗi hoặc trả về NaN, bỏ qua phòng này
+            if (userScore === null || crimeScore === null || envScore === null || isNaN(userScore) || isNaN(crimeScore) || isNaN(envScore)) {
+                console.warn(`-> [BỎ QUA] P_ID ${prop.id} do không thể tính toán đủ 3 thành phần điểm hoặc có giá trị NaN. userScore: ${userScore}, crimeScore: ${crimeScore}, envScore: ${envScore}`);
                 continue; // Sang phòng tiếp theo
             }
             

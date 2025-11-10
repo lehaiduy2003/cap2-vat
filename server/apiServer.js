@@ -71,6 +71,8 @@ cron.schedule('*0 1 * * *', () => {
     runJob(null).catch(err => {
         console.error('[CRON ERROR] Job tự động thất bại:', err);
     });
+},{
+    timezone: "Asia/Ho_Chi_Minh"
 });
 console.log('[SERVER] Đã lập lịch Job chạy mỗi 1h.');
 // --- 5. API ENDPOINTS ---
@@ -120,7 +122,7 @@ app.get('/api/v1/reviews/:property_id', async (req, res) => {
             'SELECT COUNT(*) as total FROM reviews WHERE property_id = $1',
             [propertyId]
         );
-        const total = parseInt(countResult.rows[0].total, 10);
+        const total = parseInt(countResult.rows[0].total, 10) || 0;
 
         // Lấy reviews với phân trang
         const reviewsResult = await pool.query(
