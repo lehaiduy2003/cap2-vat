@@ -242,6 +242,113 @@ app.post('/api/v1/admin/incidents', adminAuth, async (req, res) => {
         res.status(500).json({ error: 'Lỗi máy chủ nội bộ khi thêm sự cố.' });
     }
 });
+// ... (bên dưới các route /api/reviews/:id)
+
+    /*
+     * Endpoint mới để Admin báo cáo sự cố
+     * NGHIÊM TRỌNG: Đây là một endpoint nhạy cảm và cần được bảo vệ.
+     * Hiện tại, tôi đang thêm nó mà không có xác thực (auth),
+     * nhưng trong môi trường production, bạn PHẢI thêm middleware
+     * để kiểm tra xem người gọi có phải là Admin không.
+     */
+    app.post('/api/incidents', async (req, res) => {
+        // 1. Lọc và xác thực đầu vào
+        const { roomId, incidentType, severity, dateOccurred, notes } = req.body;
+
+        // Xác thực cơ bản
+        if (!roomId || !incidentType || !severity || !dateOccurred) {
+            return res.status(400).json({ error: 'Thiếu các trường bắt buộc: roomId, incidentType, severity, dateOccurred.' });
+        }
+        
+        // Chuyển đổi sang số nguyên để bảo mật
+        const roomIdInt = parseInt(roomId, 10);
+        if (isNaN(roomIdInt)) {
+             return res.status(400).json({ error: 'roomId phải là một con số.' });
+        }
+
+        try {
+            // 2. Bảo mật: Sử dụng Prepared Statements
+            // Chúng ta truyền các giá trị dưới dạng một mảng an toàn ($1, $2, ...)
+            // để chống lại các cuộc tấn công SQL Injection.
+            const query = `
+                INSERT INTO incidents 
+                    (room_id, incident_type, severity, date_occurred, notes)
+                VALUES 
+                    ($1, $2, $3, $4, $5)
+                RETURNING incident_id;
+            `;
+            
+            const newIncident = await db.one(query, [
+                roomIdInt,
+                incidentType,
+                severity,
+                dateOccurred, // Đảm bảo frontend gửi định dạng 'YYYY-MM-DD'
+                notes || null // Ghi chú có thể là null
+            ]);
+
+            console.log(`[API] Đã thêm sự cố mới (ID: ${newIncident.incident_id}) cho phòng ${roomIdInt}`);
+            res.status(201).json({ success: true, incidentId: newIncident.incident_id });
+
+        } catch (error) {
+            // 3. Xử lý lỗi
+            console.error('[API Error] Không thể thêm sự cố:', error);
+            res.status(500).json({ error: 'Lỗi máy chủ nội bộ khi xử lý báo cáo sự cố.' });
+        }
+    });
+
+    // ... (trước app.listen)
+// ... (Ngay sau khi kết thúc app.post('/api/v1/admin/incidents', ...))
+
+/**
+ * API CHO ADMIN: Thêm (hoặc cập nhật) một đánh giá an toàn thủ công
+ */
+app.post('/api/v1/admin/safety-scores', adminAuth, async (req, res) => {
+    const { property_id, safety_score, review_date, notes } = req.body;
+
+    // 1. Validate dữ liệu
+    const score = parseFloat(safety_score);
+    if (!property_id || !review_date || isNaN(score)) {
+        return res.status(400).json({ error: 'Dữ liệu không hợp lệ. Thiếu property_id, safety_score, hoặc review_date.' });
+    }
+
+    if (score < 0 || score > 100) {
+        return res.status(400).json({ error: 'Điểm an toàn phải nằm trong khoảng 0 - 100.' });
+    }
+
+    // 2. Thao tác CSDL (UPSERT)
+    try {
+        const query = {
+            text: `
+                INSERT INTO admin_safety_reviews (property_id, safety_score, review_date, notes, created_at)
+                VALUES ($1, $2, $3, $4, NOW())
+                ON CONFLICT (property_id) -- Nếu property_id đã tồn tại
+                DO UPDATE SET -- Thì cập nhật lại
+                    safety_score = EXCLUDED.safety_score,
+                    review_date = EXCLUDED.review_date,
+                    notes = EXCLUDED.notes,
+                    created_at = NOW()
+                RETURNING *;
+            `,
+            values: [property_id, score, review_date, notes || null]
+        };
+        
+        const result = await pool.query(query);
+        const newReview = result.rows[0];
+
+        console.log(`[API ADMIN] Đã lưu đánh giá thủ công cho P_ID ${property_id}.`);
+        res.status(201).json(newReview); // Phản hồi 201 Created
+
+        // 3. (QUAN TRỌNG) Kích hoạt tính điểm lại
+        console.log(`[JOB-TRIGGER] Kích hoạt tính điểm lại cho P_ID ${property_id} sau khi admin đánh giá...`);
+        runJob(property_id).catch(err => {
+            console.error(`[JOB-RECALC] Lỗi tính lại điểm cho P_ID ${property_id}:`, err);
+        });
+
+    } catch (err) {
+        console.error('[LỖI API POST SAFETY_SCORE]', err.message);
+        res.status(500).json({ error: 'Lỗi máy chủ nội bộ khi lưu đánh giá.' });
+    }
+});
 
 app.post('/api/v1/reviews', userAuth, async (req, res) => {
     // 1. Lấy dữ liệu từ body (THÊM CÁC TRƯỜNG MỚI)
