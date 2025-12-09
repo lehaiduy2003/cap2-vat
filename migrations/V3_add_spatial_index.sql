@@ -12,3 +12,4 @@ CREATE INDEX IF NOT EXISTS idx_properties_location_gist ON public.properties USI
 
 -- 3. Cho phép property_id được NULL (vì sự cố ghim map ngoài đường có thể không gắn với nhà nào)
 ALTER TABLE public.security_incidents ALTER COLUMN property_id DROP NOT NULL;
+-- 4. Tạo index B-tree cho cột property_id trong bảng security_incidents để tăng tốc join
