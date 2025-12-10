@@ -1,10 +1,7 @@
-// runSafetyScoreJob.js
-// Phiên bản 2.0: Tái cấu trúc thành Module
-
+// server/runSafetyScoreJob.js
 require("dotenv").config();
 const { Client } = require("pg");
 
-// --- Cấu hình Kết nối (Cho Job) ---
 const dbConfig = {
   user: process.env.PGUSER,
   host: process.env.PGHOST,
@@ -13,66 +10,127 @@ const dbConfig = {
   port: parseInt(process.env.PGPORT, 10),
 };
 
-// --- HẰNG SỐ CỦA THUẬT TOÁN ---
-
-// Trọng số cho điểm tổng
-const WEIGHTS = {
-  USER_SCORE: 0.4,
-  CRIME_SCORE: 0.4,
-  ENV_SCORE: 0.2,
-};
-
-// Trọng số cho mức độ nghiêm trọng (Tội phạm)
-const SEVERITY_WEIGHTS = {
-  low: 1.0,
-  medium: 4.0,
-  high: 8.0,
-};
-
-// Chu kỳ bán rã (ngày)
-const CRIME_HALF_LIFE_DAYS = 180;
-
-// Bán kính tìm kiếm POI (mét)
+// --- HẰNG SỐ CẤU HÌNH ---
+const WEIGHTS = { USER_SCORE: 0.4, CRIME_SCORE: 0.4, ENV_SCORE: 0.2 };
+const SEVERITY_WEIGHTS = { low: 1.0, medium: 4.0, high: 8.0 };
+const CRIME_HALF_LIFE_DAYS = 180; // Chu kỳ bán rã của sự cố (ngày)
 const ENV_SEARCH_RADIUS_METERS = 1000; // 1km
 
-// Điểm cơ bản cho Môi trường
-const ENV_BASE_SCORE = 5.0;
+// ===========================================
+// HÀM HỖ TRỢ: ĐỒNG BỘ DỮ LIỆU TỪ API GỐC (JAVA CORE)
+// ===========================================
+async function syncProperty(propertyId, client) {
+  if (!propertyId) return [];
 
-// ===========================================
-// HÀM TÍNH TOÁN 1: ĐIỂM CỘNG ĐỒNG (USER)
-// ===========================================
-async function calculateUserScore(propertyId, client) {
-  const query = {
-    text: "SELECT AVG(safety_rating) as avg_rating FROM reviews WHERE property_id = $1",
-    values: [propertyId],
-  };
+  console.log(`[SYNC] Đang đồng bộ thông tin phòng ID ${propertyId} từ API gốc...`);
   try {
-    const res = await client.query(query);
-    if (!res.rows[0] || res.rows[0].avg_rating === null) {
-      return 5.0; // Điểm trung lập
+    // Gọi API Java Core (Dựa trên biến môi trường BASE_API_URL)
+    const url = `${process.env.BASE_API_URL}/api/rooms/${propertyId}`;
+    
+    // Node.js 18+ hỗ trợ fetch native
+    const res = await fetch(url, {
+      method: "GET",
+      headers: { "Content-Type": "application/json" },
+    });
+
+    if (!res.ok) {
+      console.warn(`[SYNC FAIL] API trả về lỗi ${res.status} cho ID ${propertyId}`);
+      return [];
     }
-    const avgRating = parseFloat(res.rows[0].avg_rating);
-    // Thêm bước kiểm tra NaN để phòng trường hợp giá trị từ DB không hợp lệ
-    if (isNaN(avgRating)) {
-      console.warn(
-        `[WARN JOB] P_ID ${propertyId}: avg_rating trả về NaN. Giá trị gốc: ${res.rows[0].avg_rating}. Trả về điểm trung lập.`
-      );
-      return 5.0; // Điểm trung lập
+
+    const json = await res.json();
+    const roomData = json.data || json; 
+
+    if (!roomData || !roomData.id) {
+       console.warn(`[SYNC FAIL] Dữ liệu API không hợp lệ cho ID ${propertyId}`);
+       return [];
     }
-    return avgRating * 2.0; // Chuẩn hóa 1-5 sao -> 0-10 điểm
+
+    // Ghép địa chỉ
+    const addressParts = [
+      roomData.addressDetails,
+      roomData.ward,
+      roomData.district,
+      roomData.city
+    ].filter(p => p).join(", ");
+
+    // UPSERT vào DB Local
+    const insertQuery = {
+      text: `
+        INSERT INTO properties (id, name, address, latitude, longitude)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (id) 
+        DO UPDATE SET
+          name = EXCLUDED.name,
+          address = EXCLUDED.address,
+          latitude = EXCLUDED.latitude,
+          longitude = EXCLUDED.longitude
+        RETURNING *;
+      `,
+      values: [
+        roomData.id,
+        roomData.title || "Phòng trọ chưa đặt tên",
+        addressParts || "Chưa cập nhật địa chỉ",
+        roomData.latitude,
+        roomData.longitude
+      ]
+    };
+
+    const result = await client.query(insertQuery);
+    console.log(`[SYNC SUCCESS] Đã cập nhật phòng ID ${roomData.id}: ${roomData.title}`);
+    return result.rows;
+
   } catch (err) {
-    console.error(`[LỖI JOB] calculateUserScore P_ID ${propertyId}: ${err.message}`);
-    return null; // Trả về null nếu lỗi
+    console.error(`[SYNC ERROR] Lỗi khi gọi API /api/rooms/${propertyId}:`, err.message);
+    return [];
   }
 }
 
 // ===========================================
-// HÀM TÍNH TOÁN 2: ĐIỂM TỘI PHẠM (CRIME)
+// 1. TÍNH ĐIỂM CỘNG ĐỒNG (USER)
 // ===========================================
-async function calculateCrimeScore(propertyId, client) {
+async function calculateUserScore(propertyId, client) {
+  try {
+    const res = await client.query(
+      "SELECT AVG(safety_rating) as avg_rating FROM reviews WHERE property_id = $1",
+      [propertyId]
+    );
+    if (!res.rows[0] || res.rows[0].avg_rating === null) return 5.0;
+    return parseFloat(res.rows[0].avg_rating) * 2.0; // Quy đổi hệ 10
+  } catch (err) {
+    console.error(`[JOB ERROR] UserScore ID ${propertyId}: ${err.message}`);
+    return 5.0;
+  }
+}
+
+// ===========================================
+// 2. TÍNH ĐIỂM TỘI PHẠM (LOGIC KHÔNG GIAN MỚI)
+// ===========================================
+async function calculateCrimeScore(property, client) {
+  // Tìm sự cố gắn ID trực tiếp HOẶC sự cố trong bán kính 10km
   const query = {
-    text: "SELECT severity, incident_date FROM security_incidents WHERE property_id = $1",
-    values: [propertyId],
+    text: `
+      SELECT 
+        severity, 
+        incident_date,
+        property_id,
+        ST_Distance(
+            ST_SetSRID(ST_MakePoint($2, $3), 4326)::geography, 
+            ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)::geography
+        ) as distance_meters
+      FROM security_incidents 
+      WHERE 
+        property_id = $1 
+        OR (
+          latitude IS NOT NULL AND longitude IS NOT NULL
+          AND ST_DWithin(
+            ST_SetSRID(ST_MakePoint($2, $3), 4326)::geography,
+            ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)::geography,
+            10000 -- Quét tối đa 10km
+          )
+        )
+    `,
+    values: [property.id, property.longitude, property.latitude],
   };
 
   let totalPenalty = 0.0;
@@ -80,228 +138,150 @@ async function calculateCrimeScore(propertyId, client) {
 
   try {
     const res = await client.query(query);
-    if (res.rows.length === 0) {
-      return 10.0; // An toàn tuyệt đối
-    }
+    if (res.rows.length === 0) return 10.0;
 
     for (const incident of res.rows) {
-      const basePenalty = SEVERITY_WEIGHTS[incident.severity] || 0.0;
+      // a. Trọng số mức độ
+      const baseSeverity = SEVERITY_WEIGHTS[incident.severity] || 0.0;
+
+      // b. Trọng số thời gian (Time Decay)
       const incidentDate = new Date(incident.incident_date);
       const daysOld = (today - incidentDate) / (1000 * 60 * 60 * 24);
+      if (daysOld > 730 || daysOld < 0) continue; 
+      const timeDecay = 0.5 ** (daysOld / CRIME_HALF_LIFE_DAYS);
 
-      // Bỏ qua nếu quá cũ (2 năm) hoặc ngày trong tương lai
-      if (daysOld > 730 || daysOld < 0) continue;
+      // c. Trọng số khoảng cách (Distance Decay) - Logic yêu cầu
+      let distanceWeight = 0;
+      const dist = incident.distance_meters;
 
-      // Công thức Time Decay
-      const decayFactor = 0.5 ** (daysOld / CRIME_HALF_LIFE_DAYS);
-      totalPenalty += basePenalty * decayFactor;
+      if (incident.property_id === property.id) {
+          distanceWeight = 1.0; // Tại chỗ
+      } else if (dist <= 1000) {
+          distanceWeight = 1.0; // < 1km
+      } else if (dist <= 5000) {
+          distanceWeight = 0.5; // 1km - 5km
+      } else if (dist <= 10000) {
+          distanceWeight = 0.2; // 5km - 10km
+      } else {
+          distanceWeight = 0.0;
+      }
+
+      totalPenalty += baseSeverity * timeDecay * distanceWeight;
     }
 
     const finalScore = 10.0 - totalPenalty;
-    return Math.max(0.0, finalScore); // Đảm bảo không âm
+    return Math.max(0.0, finalScore);
+
   } catch (err) {
-    console.error(`[LỖI JOB] calculateCrimeScore P_ID ${propertyId}: ${err.message}`);
-    return null; // Trả về null nếu lỗi
+    console.error(`[JOB ERROR] CrimeScore ID ${property.id}: ${err.message}`);
+    return 10.0;
   }
 }
 
 // ===========================================
-// HÀM TÍNH TOÁN 3: ĐIỂM MÔI TRƯỜNG (ENV)
+// 3. TÍNH ĐIỂM MÔI TRƯỜNG (POI)
 // ===========================================
 async function calculateEnvScore(property, client) {
-  // Dùng PostGIS
   const query = {
     text: `
-            SELECT SUM(severity_score) AS total_weight_score
-            FROM safety_points
-            WHERE ST_DWithin(
-                location, -- Cột 'geography' của safety_points
-                ST_MakePoint($1, $2)::geography, -- Điểm 'geography' của phòng trọ
-                $3 -- Bán kính (mét)
-            );
-        `,
-    values: [
-      property.longitude, // PostGIS dùng (longitude, latitude)
-      property.latitude,
-      ENV_SEARCH_RADIUS_METERS,
-    ],
+        SELECT SUM(severity_score) AS total_weight_score
+        FROM safety_points
+        WHERE ST_DWithin(
+            location,
+            ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
+            $3
+        );
+    `,
+    values: [property.longitude, property.latitude, ENV_SEARCH_RADIUS_METERS],
   };
 
   try {
     const res = await client.query(query);
-    let totalWeightScore = 0;
-
-    if (res.rows.length > 0 && res.rows[0].total_weight_score !== null) {
-      const parsedScore = parseFloat(res.rows[0].total_weight_score);
-      if (isNaN(parsedScore)) {
-        console.warn(
-          `[WARN JOB] P_ID ${property.id}: total_weight_score trả về NaN. Giá trị gốc: ${res.rows[0].total_weight_score}. Sử dụng giá trị 0.`
-        );
-        totalWeightScore = 0;
-      } else {
-        totalWeightScore = parsedScore;
-      }
-    }
-
-    const finalScore = ENV_BASE_SCORE + totalWeightScore;
-
-    // Kẹp điểm trong khoảng [0, 10]
+    const totalWeightScore = parseFloat(res.rows[0].total_weight_score || 0);
+    const finalScore = 5.0 + totalWeightScore;
     return Math.max(0.0, Math.min(10.0, finalScore));
   } catch (err) {
-    console.error(`[LỖI JOB] calculateEnvScore P_ID ${property.id}: ${err.message}`);
-    return null; // Trả về null nếu lỗi
+    console.error(`[JOB ERROR] EnvScore ID ${property.id}: ${err.message}`);
+    return 5.0;
   }
 }
 
 // ===========================================
-// HÀM CHÍNH (MAIN JOB)
+// MAIN JOB (XỬ LÝ SONG SONG - BATCH)
 // ===========================================
-
-/**
- * Chạy Job tính điểm an toàn.
- * @param {number | null} targetPropertyId - Nếu là số, chỉ chạy cho 1 P_ID. Nếu null, chạy cho tất cả.
- */
 async function runJob(targetPropertyId = null) {
   const client = new Client(dbConfig);
-
   try {
     await client.connect();
 
-    // 1. Lấy danh sách phòng trọ cần xử lý
-    let propertiesQuery;
+    let properties = [];
+    
+    // 1. Lấy danh sách cần tính
     if (targetPropertyId) {
-      propertiesQuery = {
-        text: "SELECT * FROM properties WHERE id = $1",
-        values: [targetPropertyId],
-      };
+      // Tìm DB Local
+      const res = await client.query("SELECT * FROM properties WHERE id = $1", [targetPropertyId]);
+      properties = res.rows;
+
+      // [QUAN TRỌNG] Nếu không có, gọi Sync từ Java Core
+      if (properties.length === 0) {
+        console.log(`[JOB INFO] Phòng ID ${targetPropertyId} chưa có. Syncing...`);
+        properties = await syncProperty(targetPropertyId, client);
+      }
     } else {
-      propertiesQuery = "SELECT * FROM properties";
+      // Cron Job: Lấy hết
+      const res = await client.query("SELECT * FROM properties");
+      properties = res.rows;
     }
 
-    let properties = await client.query(propertiesQuery);
-    if (properties.rowCount === 0) {
-      const syncedProperties = await syncProperty(targetPropertyId, client);
-      if (!syncedProperties || syncedProperties.length === 0) {
-        console.warn(`[JOB WARNING] Không tìm thấy phòng trọ nào để xử lý. Kết thúc Job.`);
-        return; // Kết thúc Job nếu không lấy được phòng trọ
-      }
-      properties = { rows: syncedProperties };
+    if (properties.length === 0) {
+        console.log(`[JOB WARNING] Không có dữ liệu để xử lý.`);
+        return; 
     }
 
-    // 2. Lặp qua từng phòng và tính điểm
-    for (const prop of properties.rows) {
-      const userScore = await calculateUserScore(prop.id, client);
-      const crimeScore = await calculateCrimeScore(prop.id, client);
-      const envScore = await calculateEnvScore(prop, client);
+    console.log(`[JOB] Đang tính điểm cho ${properties.length} phòng trọ...`);
 
-      // 3. Xử lý lỗi (Rất quan trọng)
-      // Nếu 1 trong 3 hàm con bị lỗi hoặc trả về NaN, bỏ qua phòng này
-      if (
-        userScore === null ||
-        crimeScore === null ||
-        envScore === null ||
-        isNaN(userScore) ||
-        isNaN(crimeScore) ||
-        isNaN(envScore)
-      ) {
-        console.warn(
-          `-> [BỎ QUA] P_ID ${prop.id} do không thể tính toán đủ 3 thành phần điểm hoặc có giá trị NaN. userScore: ${userScore}, crimeScore: ${crimeScore}, envScore: ${envScore}`
-        );
-        continue; // Sang phòng tiếp theo
-      }
+    // 2. Chạy Batch (50 phòng/lần)
+    const BATCH_SIZE = 50; 
+    for (let i = 0; i < properties.length; i += BATCH_SIZE) {
+        const batch = properties.slice(i, i + BATCH_SIZE);
+        
+        await Promise.all(batch.map(async (prop) => {
+            try {
+                if (prop.latitude == null || prop.longitude == null) return;
 
-      // 4. Tính điểm tổng hợp
-      const overallScore =
-        userScore * WEIGHTS.USER_SCORE +
-        crimeScore * WEIGHTS.CRIME_SCORE +
-        envScore * WEIGHTS.ENV_SCORE;
+                const [userScore, crimeScore, envScore] = await Promise.all([
+                    calculateUserScore(prop.id, client),
+                    calculateCrimeScore(prop, client),
+                    calculateEnvScore(prop, client)
+                ]);
 
-      // 5. Lưu kết quả vào DB (UPSERT)
-      const upsertQuery = {
-        text: `
-            INSERT INTO property_safety_scores 
-                (property_id, overall_score, user_score, crime_score, environment_score, last_updated_at)
-            VALUES 
-                ($1, $2, $3, $4, $5, NOW())
-            ON CONFLICT (property_id) 
-            DO UPDATE SET
-                overall_score = EXCLUDED.overall_score,
-                user_score = EXCLUDED.user_score,
-                crime_score = EXCLUDED.crime_score,
-                environment_score = EXCLUDED.environment_score,
-                last_updated_at = NOW();
-        `,
-        values: [
-          prop.id,
-          overallScore.toFixed(1),
-          userScore.toFixed(1),
-          crimeScore.toFixed(1),
-          envScore.toFixed(1),
-        ],
-      };
+                const overallScore = (userScore * WEIGHTS.USER_SCORE) + 
+                                     (crimeScore * WEIGHTS.CRIME_SCORE) + 
+                                     (envScore * WEIGHTS.ENV_SCORE);
 
-      await client.query(upsertQuery);
+                await client.query(`
+                    INSERT INTO property_safety_scores 
+                        (property_id, overall_score, user_score, crime_score, environment_score, last_updated_at)
+                    VALUES ($1, $2, $3, $4, $5, NOW())
+                    ON CONFLICT (property_id) DO UPDATE SET
+                        overall_score = EXCLUDED.overall_score,
+                        user_score = EXCLUDED.user_score,
+                        crime_score = EXCLUDED.crime_score,
+                        environment_score = EXCLUDED.environment_score,
+                        last_updated_at = NOW();
+                `, [prop.id, overallScore.toFixed(1), userScore.toFixed(1), crimeScore.toFixed(1), envScore.toFixed(1)]);
+                
+            } catch (pErr) {
+                console.error(`Lỗi xử lý ID ${prop.id}:`, pErr.message);
+            }
+        }));
     }
+    console.log(`[JOB] Hoàn thành.`);
   } catch (err) {
-    // Lỗi kết nối hoặc lỗi truy vấn 'properties'
-    console.error(`[JOB ERROR] Job thất bại: ${err.message}`, err.stack);
+    console.error("[JOB FATAL ERROR]", err);
   } finally {
     await client.end();
   }
 }
 
-async function syncProperty(propertyId, client) {
-  // Kiểm tra nếu property đã tồn tại
-  try {
-    let url;
-    if (propertyId) {
-      url = `${process.env.BASE_API_URL}/api/rooms/${propertyId}`;
-    } else {
-      url = `${process.env.BASE_API_URL}/api/rooms?limit=1000`; // Giới hạn 1000 phòng trọ cho mỗi lần đồng bộ
-    }
-
-    const res = await fetch(url, {
-      method: "GET",
-      headers: {
-        "Content-Type": "application/json",
-      },
-    });
-    if (!res.ok) {
-      throw new Error(`HTTP error! status: ${res.status}`);
-    }
-    const json = await res.json();
-    const data = json.data; // Giả sử response có { data: [roomDTO] }
-    const rooms = Array.isArray(data) ? data : [data];
-
-    if (rooms.length === 0) return; // Kết thúc Job nếu không lấy được phòng trọ
-
-    const values = rooms.map((room) => {
-      const addressParts = [room.addressDetails, room.ward, room.district, room.city]
-        .filter((part) => part)
-        .join(", ");
-      room.address = addressParts;
-      return `(${room.id}, '${room.title}', '${room.address}', ${room.latitude}, ${room.longitude})`;
-    });
-    const syncQuery = {
-      text: `
-            INSERT INTO properties (id, name, address, latitude, longitude)
-            VALUES ${values.join(", ")}
-            ON CONFLICT (id)
-            DO UPDATE SET
-                name = EXCLUDED.name,
-                address = EXCLUDED.address,
-                latitude = EXCLUDED.latitude,
-                longitude = EXCLUDED.longitude
-            RETURNING *;
-          `,
-    };
-    const result = await client.query(syncQuery);
-    return result.rows; // Return the array of updated properties
-  } catch (syncError) {
-    console.error(`[SYNC FAILED] Không thể đồng bộ P_ID ${propertyId}:`, syncError.message);
-    return; // Kết thúc Job nếu không lấy được phòng trọ
-  }
-}
-module.exports = {
-  runJob,
-};
+module.exports = { runJob };
