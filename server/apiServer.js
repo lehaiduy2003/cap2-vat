@@ -91,7 +91,57 @@ async function ensurePropertyExists(propertyId) {
         throw new Error(`Phòng trọ ID ${propertyId} không tồn tại hoặc chưa được đồng bộ.`);
     }
 }
+app.get("/api/v1/reviews/:property_id", async (req, res) => {
+  const propertyId = parseInt(req.params.property_id, 10);
+  if (isNaN(propertyId)) {
+    return res.status(400).json({ error: "ID phòng trọ không hợp lệ." });
+  }
 
+  const page = parseInt(req.query.page, 10) || 1;
+  const limit = parseInt(req.query.limit, 10) || 10;
+  const offset = (page - 1) * limit;
+
+  try {
+    // Lấy tổng số reviews
+    const countResult = await pool.query(
+      "SELECT COUNT(*) as total FROM reviews WHERE property_id = $1",
+      [propertyId]
+    );
+    const total = parseInt(countResult.rows[0].total, 10) || 0;
+
+    // Lấy reviews với phân trang
+    const reviewsResult = await pool.query(
+      `SELECT 
+                r.*,
+                CASE 
+                    WHEN r.user_id = $2 THEN 'Bạn'
+                    ELSE 'Người dùng ẩn danh'
+                END as reviewer_name
+             FROM reviews r 
+             WHERE property_id = $1 
+             ORDER BY created_at DESC 
+             LIMIT $3 OFFSET $4`,
+      [propertyId, req.user_id || null, limit, offset]
+    );
+
+    const totalPages = Math.ceil(total / limit);
+
+    res.status(200).json({
+      reviews: reviewsResult.rows,
+      pagination: {
+        currentPage: page,
+        totalPages,
+        totalItems: total,
+        itemsPerPage: limit,
+        hasNext: page < totalPages,
+        hasPrev: page > 1,
+      },
+    });
+  } catch (err) {
+    console.error(`[LỖI API GET REVIEWS] P_ID ${propertyId}: ${err.message}`);
+    res.status(500).json({ error: "Lỗi máy chủ nội bộ." });
+  }
+});
 // --- CRON JOB ---
 cron.schedule("0 0,12 * * *", () => {
     runJob(null).catch((err) => console.error("[CRON] Thất bại:", err));
