@@ -11,7 +11,7 @@ if (!process.env.GEMINI_API_KEY) {
 }
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const aiModel = genAI.getGenerativeModel({
-  model: process.env.GEMINI_LLM_MODEL || "gemini-2.0-flash",
+  model: process.env.GEMINI_LLM_MODEL,
 });
 
 // Cache for AI summaries with expiration
