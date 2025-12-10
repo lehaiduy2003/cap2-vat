@@ -49,31 +49,34 @@ const userAuth = (req, res, next) => {
 // --- HELPER FUNCTION: ĐỒNG BỘ PHÒNG TRỌ (JIT SYNC) ---
 // Hàm này đảm bảo Property ID luôn tồn tại trong bảng properties trước khi dùng
 async function ensurePropertyExists(propertyId) {
-    if (!propertyId) return;
+  if (!propertyId) return;
 
-    // 1. Kiểm tra trong DB nội bộ
-    const checkRes = await pool.query("SELECT id FROM properties WHERE id = $1", [propertyId]);
-    if (checkRes.rows.length > 0) return; // Đã có -> OK
+  // 1. Kiểm tra trong DB nội bộ
+  const checkRes = await pool.query("SELECT id FROM properties WHERE id = $1", [propertyId]);
+  if (checkRes.rows.length > 0) return; // Đã có -> OK
 
-    // 2. Nếu chưa có -> Gọi sang Java Core để lấy thông tin
-    console.log(`[SYNC-URGENT] Phòng ID ${propertyId} chưa có. Đang tải từ Core...`);
-    try {
-        const url = `${BASE_API_URL}/api/rooms/${propertyId}`;
-        const res = await fetch(url);
-        
-        if (!res.ok) throw new Error(`Core API trả về ${res.status}`);
-        
-        const json = await res.json();
-        // Xử lý cấu trúc response: room nằm trong 'data' hoặc trực tiếp
-        const room = json.data || json;
+  // 2. Nếu chưa có -> Gọi sang Java Core để lấy thông tin
+  console.log(`[SYNC-URGENT] Phòng ID ${propertyId} chưa có. Đang tải từ Core...`);
+  try {
+    const url = `${BASE_API_URL}/api/rooms/${propertyId}`;
+    const res = await fetch(url);
 
-        if (!room || !room.id) throw new Error("Dữ liệu phòng không hợp lệ");
+    if (!res.ok) throw new Error(`Core API trả về ${res.status}`);
 
-        // Tạo địa chỉ string
-        const addressParts = [room.addressDetails, room.ward, room.district, room.city].filter(Boolean).join(", ");
+    const json = await res.json();
+    // Xử lý cấu trúc response: room nằm trong 'data' hoặc trực tiếp
+    const room = json.data || json;
 
-        // 3. Insert vào DB nội bộ
-        await pool.query(`
+    if (!room || !room.id) throw new Error("Dữ liệu phòng không hợp lệ");
+
+    // Tạo địa chỉ string
+    const addressParts = [room.addressDetails, room.ward, room.district, room.city]
+      .filter(Boolean)
+      .join(", ");
+
+    // 3. Insert vào DB nội bộ
+    await pool.query(
+      `
             INSERT INTO properties (id, name, address, latitude, longitude)
             VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (id) DO UPDATE SET
@@ -81,15 +84,16 @@ async function ensurePropertyExists(propertyId) {
                 address = EXCLUDED.address,
                 latitude = EXCLUDED.latitude,
                 longitude = EXCLUDED.longitude
-        `, [room.id, room.title || "Phòng chưa đặt tên", addressParts, room.latitude, room.longitude]);
-        
-        console.log(`[SYNC-URGENT] Đã đồng bộ xong ID ${propertyId}`);
+        `,
+      [room.id, room.title || "Phòng chưa đặt tên", addressParts, room.latitude, room.longitude]
+    );
 
-    } catch (err) {
-        console.error(`[SYNC-FAIL] Không thể đồng bộ ID ${propertyId}:`, err.message);
-        // Ném lỗi để chặn việc insert incident vào ID không tồn tại
-        throw new Error(`Phòng trọ ID ${propertyId} không tồn tại hoặc chưa được đồng bộ.`);
-    }
+    console.log(`[SYNC-URGENT] Đã đồng bộ xong ID ${propertyId}`);
+  } catch (err) {
+    console.error(`[SYNC-FAIL] Không thể đồng bộ ID ${propertyId}:`, err.message);
+    // Ném lỗi để chặn việc insert incident vào ID không tồn tại
+    throw new Error(`Phòng trọ ID ${propertyId} không tồn tại hoặc chưa được đồng bộ.`);
+  }
 }
 app.get("/api/v1/reviews/:property_id", async (req, res) => {
   const propertyId = parseInt(req.params.property_id, 10);
@@ -143,22 +147,25 @@ app.get("/api/v1/reviews/:property_id", async (req, res) => {
   }
 });
 // --- CRON JOB ---
-cron.schedule("0 0,12 * * *", () => {
+cron.schedule(
+  "0 0,12 * * *",
+  () => {
     runJob(null).catch((err) => console.error("[CRON] Thất bại:", err));
-}, { timezone: "Asia/Ho_Chi_Minh" });
-
+  },
+  { timezone: "Asia/Ho_Chi_Minh" }
+);
 
 // ================= API ENDPOINTS =================
 
 // 1. API Tìm kiếm (Cho Dropdown)
 app.get("/api/v1/admin/properties-search", adminAuth, async (req, res) => {
-    const { q, lat, lng, radius } = req.query;
-    try {
-        let queryText = "";
-        let queryValues = [];
+  const { q, lat, lng, radius } = req.query;
+  try {
+    let queryText = "";
+    let queryValues = [];
 
-        if (lat && lng) {
-            queryText = `
+    if (lat && lng) {
+      queryText = `
                 SELECT id, name, address, 
                        ST_Distance(
                            ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)::geography,
@@ -172,26 +179,27 @@ app.get("/api/v1/admin/properties-search", adminAuth, async (req, res) => {
                 )
                 ORDER BY dist ASC LIMIT 20;
             `;
-            queryValues = [parseFloat(lng), parseFloat(lat), parseInt(radius || 100)];
-        } else if (q) {
-            queryText = `SELECT id, name, address FROM properties WHERE name ILIKE $1 OR address ILIKE $1 LIMIT 20;`;
-            queryValues = [`%${q}%`];
-        } else {
-            return res.json([]);
-        }
-
-        const result = await pool.query(queryText, queryValues);
-        res.json(result.rows);
-    } catch (err) {
-        console.error("[SEARCH ERROR]", err.message);
-        res.status(500).json({ error: "Lỗi tìm kiếm." });
+      queryValues = [parseFloat(lng), parseFloat(lat), parseInt(radius || 100)];
+    } else if (q) {
+      queryText = `SELECT id, name, address FROM properties WHERE name ILIKE $1 OR address ILIKE $1 LIMIT 20;`;
+      queryValues = [`%${q}%`];
+    } else {
+      return res.json([]);
     }
+
+    const result = await pool.query(queryText, queryValues);
+    res.json(result.rows);
+  } catch (err) {
+    console.error("[SEARCH ERROR]", err.message);
+    res.status(500).json({ error: "Lỗi tìm kiếm." });
+  }
 });
 
 // 2. API Thêm sự cố (FIX LỖI FOREIGN KEY)
 app.post("/api/v1/admin/incidents", adminAuth, async (req, res) => {
-  const { property_id, incident_type, severity, incident_date, notes, latitude, longitude } = req.body;
-  
+  const { property_id, incident_type, severity, incident_date, notes, latitude, longitude } =
+    req.body;
+
   const lat = parseFloat(latitude);
   const lng = parseFloat(longitude);
   const hasCoordinates = !isNaN(lat) && !isNaN(lng);
@@ -202,14 +210,22 @@ app.post("/api/v1/admin/incidents", adminAuth, async (req, res) => {
   try {
     // [FIX QUAN TRỌNG] Đảm bảo Property tồn tại trước khi insert Incident
     if (property_id) {
-        await ensurePropertyExists(property_id);
+      await ensurePropertyExists(property_id);
     }
     // 1. Insert Sự cố
     const insertQuery = {
       text: `INSERT INTO security_incidents 
              (property_id, incident_type, severity, incident_date, notes, latitude, longitude)
              VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
-      values: [property_id || null, incident_type, severity, incident_date, notes || null, hasCoordinates ? lat : null, hasCoordinates ? lng : null],
+      values: [
+        property_id || null,
+        incident_type,
+        severity,
+        incident_date,
+        notes || null,
+        hasCoordinates ? lat : null,
+        hasCoordinates ? lng : null,
+      ],
     };
 
     const result = await pool.query(insertQuery);
@@ -220,30 +236,29 @@ app.post("/api/v1/admin/incidents", adminAuth, async (req, res) => {
     if (property_id) affectedIds.add(property_id);
 
     if (hasCoordinates) {
-        const neighbors = await pool.query({
-            text: `SELECT id FROM properties 
+      const neighbors = await pool.query({
+        text: `SELECT id FROM properties 
                    WHERE ST_DWithin(
                      ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)::geography,
                      ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
                      10000 
                    )`,
-            values: [lng, lat]
-        });
-        neighbors.rows.forEach(r => affectedIds.add(r.id));
+        values: [lng, lat],
+      });
+      neighbors.rows.forEach((r) => affectedIds.add(r.id));
     }
 
     // 3. Trigger Job tính điểm
     if (affectedIds.size > 0) {
-        console.log(`[TRIGGER] Sự cố ảnh hưởng ${affectedIds.size} phòng. Recalc...`);
-        (async () => {
-            for (const pid of affectedIds) {
-                await runJob(pid).catch(e => console.error(`Job Fail ID ${pid}:`, e.message));
-            }
-        })();
+      console.log(`[TRIGGER] Sự cố ảnh hưởng ${affectedIds.size} phòng. Recalc...`);
+      (async () => {
+        for (const pid of affectedIds) {
+          await runJob(pid).catch((e) => console.error(`Job Fail ID ${pid}:`, e.message));
+        }
+      })();
     }
 
     res.status(201).json(newIncident);
-
   } catch (err) {
     console.error("[INCIDENT ERROR]", err.message);
     res.status(500).json({ error: err.message || "Lỗi Server." });
@@ -437,22 +452,300 @@ app.post("/api/v1/reviews", userAuth, async (req, res) => {
 });
 
 app.post("/api/v1/internal/sync/property", async (req, res) => {
-    const { id, name, address, latitude, longitude } = req.body;
-    try {
-        await pool.query(`
+  const { id, name, address, latitude, longitude } = req.body;
+  try {
+    await pool.query(
+      `
             INSERT INTO properties (id, name, address, latitude, longitude)
             VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (id) DO UPDATE SET
                 name = EXCLUDED.name, address = EXCLUDED.address,
                 latitude = EXCLUDED.latitude, longitude = EXCLUDED.longitude
-        `, [id, name, address, latitude, longitude]);
-        runJob(id);
-        res.json({ success: true });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+        `,
+      [id, name, address, latitude, longitude]
+    );
+    runJob(id);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-app.get("/health", (req, res) => res.json({ status: "OK" }));
+/**
+ * POST /api/v1/documents
+ * Create a document record and trigger RAG processing
+ * Requires: x-user-id header (owner ID)
+ */
+app.post("/api/v1/documents", userAuth, async (req, res) => {
+  try {
+    const ownerId = req.user_id;
+    const { title, original_filename, upload_url, property_id, metadata } = req.body;
 
+    // Validate required fields
+    if (!title || !original_filename || !upload_url) {
+      return res.status(400).json({
+        error: "Missing required fields: title, original_filename, upload_url",
+      });
+    }
+
+    // Validate URL format
+    try {
+      new URL(upload_url);
+    } catch (err) {
+      return res.status(400).json({
+        error: "Invalid upload_url format",
+      });
+    }
+
+    // Extract additional fields from metadata
+    const description = metadata?.description || null;
+    const price = metadata?.price ? parseFloat(metadata.price) : null;
+    const address_details = metadata?.address_details || null;
+    const room_size = metadata?.room_size ? parseInt(metadata.room_size) : null;
+
+    // Insert document record
+    const insertQuery = {
+      text: `
+        INSERT INTO documents (
+          title, original_filename, upload_url, owner_id, property_id, 
+          description, price, address_details, room_size, metadata, status
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'processing')
+        RETURNING *
+      `,
+      values: [
+        title,
+        original_filename,
+        upload_url,
+        ownerId.toString(),
+        property_id || null,
+        description,
+        price,
+        address_details,
+        room_size,
+        metadata || {},
+      ],
+    };
+
+    const result = await pool.query(insertQuery);
+    const document = result.rows[0];
+
+    // Trigger RAG processing asynchronously (don't await - fire and forget)
+    const { processDocumentAsync } = require("./ragClient");
+    processDocumentAsync(document.id, upload_url, {
+      title,
+      original_filename,
+      owner_id: ownerId.toString(),
+      property_id,
+      description,
+      price,
+      address_details,
+      room_size,
+    }).catch((err) => {
+      console.error(`[RAG Processing ERROR] Document ${document.id}:`, err.message);
+    });
+
+    // Return success response immediately
+    res.status(201).json({
+      success: true,
+      document_id: document.id,
+      message: "Document created successfully. Processing started.",
+      document: {
+        id: document.id,
+        title: document.title,
+        original_filename: document.original_filename,
+        upload_url: document.upload_url,
+        owner_id: document.owner_id,
+        property_id: document.property_id,
+        status: document.status,
+        created_at: document.created_at,
+      },
+    });
+  } catch (error) {
+    console.error("[DOCUMENT CREATE ERROR]", error.message);
+    res.status(500).json({ error: "Failed to create document: " + error.message });
+  }
+});
+
+/**
+ * GET /api/v1/documents
+ * Get list of documents for the authenticated owner
+ * Requires: x-user-id header (owner ID)
+ */
+app.get("/api/v1/documents", userAuth, async (req, res) => {
+  try {
+    const ownerId = req.user_id;
+    const { property_id, status, limit } = req.query;
+
+    let query = `
+      SELECT
+        id, title, original_filename, upload_url, owner_id, property_id,
+        description, price, address_details, room_size,
+        metadata, status, processing_started_at, processing_completed_at,
+        error_message, chunk_count, created_at, updated_at
+      FROM documents
+      WHERE owner_id = $1
+    `;
+    const params = [ownerId.toString()];
+
+    if (property_id) {
+      params.push(property_id);
+      query += ` AND property_id = $${params.length}`;
+    }
+
+    if (status) {
+      params.push(status);
+      query += ` AND status = $${params.length}`;
+    }
+
+    query += ` ORDER BY created_at DESC`;
+
+    if (limit) {
+      params.push(parseInt(limit));
+      query += ` LIMIT $${params.length}`;
+    } else {
+      query += ` LIMIT 50`;
+    }
+
+    const result = await pool.query(query, params);
+
+    res.json({
+      documents: result.rows,
+      total: result.rows.length,
+    });
+  } catch (error) {
+    console.error("[GET DOCUMENTS ERROR]", error.message);
+    res.status(500).json({ error: "Failed to fetch documents: " + error.message });
+  }
+});
+
+/**
+ * GET /api/v1/documents/:id
+ * Get a specific document by ID
+ * Requires: x-user-id header (owner ID)
+ */
+app.get("/api/v1/documents/:id", userAuth, async (req, res) => {
+  try {
+    const documentId = parseInt(req.params.id, 10);
+    const ownerId = req.user_id;
+
+    if (isNaN(documentId)) {
+      return res.status(400).json({ error: "Invalid document ID" });
+    }
+
+    const result = await pool.query(`SELECT * FROM documents WHERE id = $1 AND owner_id = $2`, [
+      documentId,
+      ownerId.toString(),
+    ]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Document not found" });
+    }
+
+    res.json({
+      document: result.rows[0],
+    });
+  } catch (error) {
+    console.error("[GET DOCUMENT ERROR]", error.message);
+    res.status(500).json({ error: "Failed to fetch document: " + error.message });
+  }
+});
+
+/**
+ * PATCH /api/v1/documents/:id
+ * Update document status and metadata (used by RAG service)
+ * Requires: x-api-key header (admin access)
+ */
+app.patch("/api/v1/documents/:id", adminAuth, async (req, res) => {
+  try {
+    const documentId = parseInt(req.params.id, 10);
+    const {
+      status,
+      metadata,
+      error_message,
+      chunk_count,
+      processing_started_at,
+      processing_completed_at,
+    } = req.body;
+
+    if (isNaN(documentId)) {
+      return res.status(400).json({ error: "Invalid document ID" });
+    }
+
+    // Build dynamic update query
+    const updates = [];
+    const values = [];
+    let paramIndex = 1;
+
+    if (status) {
+      updates.push(`status = $${paramIndex++}`);
+      values.push(status);
+    }
+
+    if (metadata) {
+      updates.push(`metadata = $${paramIndex++}`);
+      values.push(metadata);
+    }
+
+    if (error_message !== undefined) {
+      updates.push(`error_message = $${paramIndex++}`);
+      values.push(error_message);
+    }
+
+    if (chunk_count !== undefined) {
+      updates.push(`chunk_count = $${paramIndex++}`);
+      values.push(chunk_count);
+    }
+
+    if (processing_started_at) {
+      updates.push(`processing_started_at = $${paramIndex++}`);
+      values.push(processing_started_at);
+    }
+
+    if (processing_completed_at) {
+      updates.push(`processing_completed_at = $${paramIndex++}`);
+      values.push(processing_completed_at);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: "No fields to update" });
+    }
+
+    values.push(documentId);
+    const query = `
+      UPDATE documents
+      SET ${updates.join(", ")}
+      WHERE id = $${paramIndex}
+      RETURNING *
+    `;
+
+    const result = await pool.query(query, values);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Document not found" });
+    }
+
+    res.json({
+      success: true,
+      document: result.rows[0],
+    });
+  } catch (error) {
+    console.error("[UPDATE DOCUMENT ERROR]", error.message);
+    res.status(500).json({ error: "Failed to update document: " + error.message });
+  }
+});
+
+// Endpoint "Health Check"
+app.get("/health", (req, res) => {
+  res.status(200).json({ status: "API Server is running healthy." });
+});
+app.get("/admin", (req, res) => {
+  res.sendFile(path.join(publicPath, "admin.html"));
+});
+app.get("/review", (req, res) => {
+  res.sendFile(path.join(publicPath, "review.html"));
+});
+
+// Khởi động Server
 app.listen(PORT, () => {
   console.log(`[SERVER] Running on http://localhost:${PORT}`);
 });

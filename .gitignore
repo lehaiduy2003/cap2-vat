@@ -8,3 +8,5 @@ node_modules/
 # Từ GitHub (ví dụ)
 *.log
 *.tmp
+
+uploads
