@@ -3,10 +3,9 @@ const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, "../.env") });
 
 const express = require("express");
-const { Pool } = require("pg");
 const cors = require("cors");
 const cron = require("node-cron");
-
+const { pool } = require("./config/db"); // [FIX] Dùng pool chung
 const { runJob } = require("./runSafetyScoreJob");
 const { generateAISummary } = require("./aiUtils");
 
@@ -22,10 +21,6 @@ const dbConfig = {
   password: process.env.PGPASSWORD,
   port: parseInt(process.env.PGPORT, 10),
 };
-
-const pool = new Pool(dbConfig);
-pool.on("error", (err) => console.error("[DB POOL ERROR]", err));
-
 app.use(cors());
 app.use(express.json());
 const publicPath = path.join(__dirname, "../public");
