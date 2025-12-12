@@ -264,6 +264,11 @@ async function processDocumentFromUrl(documentId, uploadUrl, metadata = {}) {
         owner_id: metadata.owner_id,
         property_id: metadata.property_id,
         kb_scope: metadata.property_id ? "property" : "owner",
+        // Include property details for document enrichment
+        description: metadata.description,
+        price: metadata.price,
+        room_size: metadata.room_size,
+        address_details: metadata.address_details,
       },
     });
 
@@ -283,14 +288,17 @@ async function processDocumentFromUrl(documentId, uploadUrl, metadata = {}) {
 
 /**
  * Async wrapper for processDocumentFromUrl (fire and forget)
+ * Returns a Promise so it can be chained with .catch() if needed
  */
 function processDocumentAsync(documentId, uploadUrl, metadata = {}) {
-  // Start processing but don't wait for it to complete
-  processDocumentFromUrl(documentId, uploadUrl, metadata).catch((err) => {
-    console.error(`[RAG Client] Async processing failed for document ${documentId}:`, err.message);
-  });
-
   console.log(`[RAG Client] Triggered async processing for document ${documentId}`);
+
+  // Return the promise so caller can handle errors if needed
+  return processDocumentFromUrl(documentId, uploadUrl, metadata).catch((err) => {
+    console.error(`[RAG Client] Async processing failed for document ${documentId}:`, err.message);
+    // Re-throw to allow caller to handle if they want
+    throw err;
+  });
 }
 
 module.exports = {
