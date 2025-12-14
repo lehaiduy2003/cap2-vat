@@ -21,7 +21,7 @@ WORKDIR /app
 COPY --from=build /app/node_modules ./node_modules
 
 # Copy application code
-COPY --from=build /app/server ./server
+COPY --from=build /app/src ./src
 COPY --from=build /app/migrations ./migrations
 COPY --from=build /app/package.json ./
 COPY --from=build /app/entrypoint.sh ./entrypoint.sh
