@@ -155,8 +155,7 @@ async function processDocumentFromUrl(documentId, uploadUrl, metadata = {}) {
 async function testRAGConnection() {
   try {
     const health = await checkRAGHealth();
-    if(!health)
-      return false;
+    if (!health) return false;
     return true;
   } catch (error) {
     console.error("[RAG] ✗ RAG service connection failed:", error.message);
