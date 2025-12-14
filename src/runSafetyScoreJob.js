@@ -14,6 +14,22 @@ async function runJob(targetPropertyId = null) {
       const res = await client.query("SELECT id, latitude, longitude FROM properties WHERE id = $1", [targetPropertyId]);
       if (res.rows.length > 0) {
           await processProperty(client, res.rows[0]);
+      } else {
+        // fetch property via BE api
+        const resApi = await fetch(`${process.env.BASE_API_URL}/api/rooms/${targetPropertyId}`);
+        if (resApi.ok) {
+          const prop = await resApi.json();
+          await client.query(`insert into properties (id, name, address, latitude, longitude) values ($1, $2, $3, $4, $5)
+            on conflict (id) do update set name = EXCLUDED.name, address = EXCLUDED.address, latitude = EXCLUDED.latitude, longitude = EXCLUDED.longitude
+          `, [prop.data.id, prop.data.title, prop.data.addressDetails, prop.data.latitude, prop.data.longitude]);
+          await processProperty(client, {
+            id: prop.data.id,
+            latitude: prop.data.latitude,
+            longitude: prop.data.longitude
+          });
+        } else {
+          console.warn(`[Job] Không tìm thấy phòng trọ ID: ${targetPropertyId}`);
+        }
       }
     } else {
       // --- MODE 2: XỬ LÝ TOÀN BỘ (Cron Job) ---
@@ -48,7 +64,6 @@ async function runJob(targetPropertyId = null) {
 // Hàm xử lý logic cốt lõi
 async function processProperty(client, prop) {
     if (!prop.latitude || !prop.longitude) return;
-
     try {
         const [user, crime, env] = await Promise.all([
             safetyService.calculateUserScore(client, prop.id),

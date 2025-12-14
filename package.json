@@ -2,11 +2,13 @@
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
     "axios": "^1.12.2",
+    "bullmq": "^5.34.3",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
     "form-data": "^4.0.0",
     "fs-extra": "^11.3.2",
+    "ioredis": "^5.4.2",
     "mammoth": "^1.6.0",
     "multer": "^2.0.2",
     "node-cron": "^4.2.1",
@@ -17,11 +19,11 @@
   "name": "safety_module",
   "version": "1.0.0",
   "description": "Module chấm điểm an toàn phòng trọ",
-  "main": "server/apiServer.js",
+  "main": "src/apiServer.js",
   "scripts": {
-    "start": "node server/apiServer.js",
-    "dev": "nodemon server/apiServer.js",
-    "run-job-manually": "node server/runSafetyScoreJob.js",
+    "start": "node src/apiServer.js",
+    "dev": "nodemon src/apiServer.js",
+    "run-job-manually": "node src/runSafetyScoreJob.js",
     "migration:run": "node migrations/run.js"
   },
   "devDependencies": {
