@@ -18,6 +18,7 @@ const documentRoutes = require("./routes/documents");
 const reviewRoutes = require("./routes/reviews");
 const adminRoutes = require("./routes/admin");
 const propertyRoutes = require("./routes/properties");
+const floodRoutes = require("./routes/floods");
 
 const app = express();
 const PORT = process.env.API_PORT || 3000;
@@ -32,6 +33,7 @@ app.use("/api/v1", documentRoutes);
 app.use("/api/v1", reviewRoutes);
 app.use("/api/v1", adminRoutes);
 app.use("/api/v1", propertyRoutes);
+app.use("/api/v1", floodRoutes);
 
 // --- CRON JOB ---
 cron.schedule(
