@@ -13,3 +13,5 @@ CREATE INDEX IF NOT EXISTS idx_properties_location_gist ON public.properties USI
 -- 3. Cho phép cột property_id nhận giá trị NULL
 -- (Vì khi Admin ghim map ngoài đường, sự cố đó không thuộc về nhà trọ cụ thể nào)
 ALTER TABLE public.security_incidents ALTER COLUMN property_id DROP NOT NULL;
+-- 4.Thêm cột vào bảng properties để lưu vị trí đường ray
+ALTER TABLE properties ADD COLUMN IF NOT EXISTS static_noise_data JSONB DEFAULT '{}';

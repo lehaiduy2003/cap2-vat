@@ -151,7 +151,93 @@ cron.schedule(
 );
 
 // ================= API ENDPOINTS =================
+// API: Người dùng báo cáo điểm ngập lụt
+app.post("/api/v1/flood-reports", userAuth, async (req, res) => {
+  const { latitude, longitude, water_level, description } = req.body;
+  const user_id = req.user_id;
 
+  // Validate dữ liệu
+  if (!latitude || !longitude || !water_level) {
+    return res.status(400).json({ error: "Thiếu thông tin tọa độ hoặc mức nước." });
+  }
+
+  try {
+    // Lưu vào bảng flood_reports
+    // Sử dụng PostGIS để tạo điểm địa lý từ lat/long
+    const query = `
+      INSERT INTO flood_reports (user_id, water_level, description, report_date, location)
+      VALUES ($1, $2, $3, NOW(), ST_SetSRID(ST_MakePoint($5, $4), 4326))
+      RETURNING id;
+    `;
+    
+    await pool.query(query, [
+      user_id, 
+      parseInt(water_level), 
+      description, 
+      parseFloat(latitude), 
+      parseFloat(longitude)
+    ]);
+
+    // [Tùy chọn] Trigger tính lại điểm cho các phòng trọ xung quanh ngay lập tức
+    // Tìm các phòng trọ trong bán kính 200m và chạy lại Job
+    const nearbyProps = await pool.query(`
+      SELECT id FROM properties 
+      WHERE ST_DWithin(
+        ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
+        ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)::geography,
+        200
+      )
+    `, [parseFloat(longitude), parseFloat(latitude)]);
+
+    // Chạy ngầm (Fire & Forget)
+    nearbyProps.rows.forEach(row => {
+        runJob(row.id).catch(e => console.error(`Recalc failed for prop ${row.id}`));
+    });
+
+    res.status(201).json({ success: true, message: "Cảm ơn bạn đã báo cáo điểm ngập!" });
+
+  } catch (err) {
+    console.error("[FLOOD REPORT ERROR]", err.message);
+    res.status(500).json({ error: "Lỗi server khi lưu báo cáo." });
+  }
+});
+// API: Lấy lịch sử điểm ngập lụt gần vị trí người dùng
+app.get("/api/v1/flood-reports", async (req, res) => {
+  const { lat, lng } = req.query;
+
+  if (!lat || !lng) {
+    return res.status(400).json({ error: "Missing lat/lng" });
+  }
+
+  try {
+    const query = `
+      SELECT 
+        id, 
+        water_level, 
+        description, 
+        report_date,
+        ST_Distance(
+          location, 
+          ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography
+        ) as distance_meters
+      FROM flood_reports
+      WHERE ST_DWithin(
+        location, 
+        ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, 
+        100 -- Lấy bán kính 100m xung quanh trọ
+      )
+      ORDER BY report_date DESC
+      LIMIT 20
+    `;
+    
+    const result = await pool.query(query, [parseFloat(lng), parseFloat(lat)]);
+    
+    res.json(result.rows);
+  } catch (err) {
+    console.error("[GET FLOOD HISTORY ERROR]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 // 1. API Tìm kiếm (Cho Dropdown)
 app.get("/api/v1/admin/properties-search", adminAuth, async (req, res) => {
   const { q, lat, lng, radius } = req.query;
@@ -260,27 +346,114 @@ app.post("/api/v1/admin/incidents", adminAuth, async (req, res) => {
   }
 });
 // --- CÁC API CŨ ---
+// Sửa từ app.post thành app.get
+// ---------------------------------------------------------
+// 1. API GET (MỚI): Dành cho Frontend gọi lấy điểm (Không cần gửi body)
+// ---------------------------------------------------------
+// --- THÊM ĐOẠN NÀY VÀO server/apiServer.js ---
+
+// 1. API GET (MỚI): Dành cho Widget Frontend (Không cần body)
+app.get("/api/v1/properties/:id/safety", async (req, res) => {
+  const propertyId = parseInt(req.params.id, 10);
+  if (isNaN(propertyId)) {
+    return res.status(400).json({ error: "ID phòng trọ không hợp lệ." });
+  }
+
+  try {
+    // Bước A: Tự lấy thông tin phòng từ DB (Vì GET không gửi kèm thông tin này)
+    const propResult = await pool.query("SELECT * FROM properties WHERE id = $1", [propertyId]);
+    const propertyData = propResult.rows[0];
+
+    // Bước B: Lấy điểm an toàn
+    let result = await pool.query("SELECT * FROM property_safety_scores WHERE property_id = $1", [
+      propertyId,
+    ]);
+
+    // Nếu chưa có điểm -> Tính toán ngay (Lazy calculation)
+    if (result.rowCount === 0) {
+      if (!propertyData) {
+         // Nếu phòng không tồn tại trong DB thì không thể tính
+         return res.status(404).json({ error: "Phòng trọ không tồn tại." });
+      }
+      try {
+        console.log(`[Cache Miss - GET] Đang tính điểm cho ID ${propertyId}...`);
+        await runJob(propertyId); 
+        result = await pool.query("SELECT * FROM property_safety_scores WHERE property_id = $1", [
+          propertyId,
+        ]);
+      } catch (error) {
+        console.error(`[LỖI API] Không thể chạy job an toàn: ${error.message}`);
+      }
+    }
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Chưa có dữ liệu điểm an toàn." });
+    }
+
+    const safetyData = result.rows[0];
+    
+    // Bước C: Tạo AI Summary nếu chưa có (Hoặc trả về null để Frontend chờ)
+    let aiSummary = safetyData.ai_summary;
+    const { crime_score, user_score, env_score } = safetyData;
+
+    // Chỉ gọi AI khi có đủ điểm số
+    if (!aiSummary && crime_score !== null) {
+      const reviewsResult = await pool.query(
+        "SELECT safety_rating, cleanliness_rating, amenities_rating, host_rating, review_text FROM reviews WHERE property_id = $1 ORDER BY created_at DESC LIMIT 10",
+        [propertyId]
+      );
+      
+      // [QUAN TRỌNG NHẤT]: Truyền mảng rỗng [] thay vì nearbyPlaces
+      // Vì API GET không biết nearbyPlaces là gì, truyền [] để AI không bị lỗi.
+      aiSummary = await generateAISummary(
+        parseFloat(crime_score),
+        parseFloat(user_score),
+        parseFloat(env_score),
+        propertyData || { title: "Phòng trọ", address: "Đà Nẵng" }, 
+        [], // <--- KHẮC PHỤC LỖI 500 TẠI ĐÂY
+        reviewsResult.rows
+      );
+    }
+
+    res.status(200).json({
+      ...safetyData,
+      ai_summary: aiSummary,
+      property_lat: propertyData.latitude,
+      property_lng: propertyData.longitude, // <--- KHẮC PHỤC LỖI 500 TẠI ĐÂY
+      property_address: propertyData.address || propertyData.addressDetails
+    });
+
+  } catch (err) {
+    console.error(`[LỖI API GET] P_ID ${propertyId}: ${err.message}`);
+    res.status(500).json({ error: "Lỗi máy chủ nội bộ: " + err.message });
+  }
+});
+// ---------------------------------------------------------
+// 2. API POST (CŨ - GIỮ NGUYÊN): Dành cho Client gửi kèm dữ liệu chi tiết
+// ---------------------------------------------------------
 app.post("/api/v1/properties/:id/safety", async (req, res) => {
   const propertyId = parseInt(req.params.id, 10);
   if (isNaN(propertyId)) {
     return res.status(400).json({ error: "ID phòng trọ không hợp lệ." });
   }
+  
+  // POST lấy dữ liệu từ Body
   const { property, nearbyPlaces } = req.body;
 
   try {
     let result = await pool.query("SELECT * FROM property_safety_scores WHERE property_id = $1", [
       propertyId,
     ]);
+    
     if (result.rowCount === 0) {
       try {
+        console.log(`[Cache Miss - POST] Đang tính điểm cho ID ${propertyId}...`);
         await runJob(propertyId);
         result = await pool.query("SELECT * FROM property_safety_scores WHERE property_id = $1", [
           propertyId,
         ]);
         if (result.rowCount === 0) {
-          return res
-            .status(404)
-            .json({ error: "Không tìm thấy điểm an toàn. (Job chưa chạy hoặc không có dữ liệu)" });
+          return res.status(404).json({ error: "Không tìm thấy điểm an toàn." });
         }
       } catch (error) {
         console.error(`[LỖI API] Không thể chạy job an toàn: ${error.message}`);
@@ -290,27 +463,22 @@ app.post("/api/v1/properties/:id/safety", async (req, res) => {
     const safetyData = result.rows[0];
     const { crime_score, user_score, env_score } = safetyData;
 
-    // Generate AI summary if scores are available
     let aiSummary = null;
     if (crime_score !== null && user_score !== null && env_score !== null) {
-      const crimeScore = parseFloat(crime_score);
-      const userScore = parseFloat(user_score);
-      const envScore = parseFloat(env_score);
-
-      // Fetch reviews for the property
       const reviewsResult = await pool.query(
         "SELECT safety_rating, cleanliness_rating, amenities_rating, host_rating, review_text FROM reviews WHERE property_id = $1 ORDER BY created_at DESC",
         [propertyId]
       );
-      const reviews = reviewsResult.rows;
-
+      
+      // POST có ưu thế là nhận được nearbyPlaces từ client (nếu có)
       aiSummary = await generateAISummary(
-        crimeScore,
-        userScore,
-        envScore,
-        property,
-        nearbyPlaces,
-        reviews
+        parseFloat(crime_score),
+        parseFloat(user_score),
+        parseFloat(env_score),
+        property || { title: "Phòng trọ" }, // Fallback nếu body thiếu property
+        nearbyPlaces || [], 
+        [],
+        reviewsResult.rows
       );
     }
 
@@ -319,10 +487,73 @@ app.post("/api/v1/properties/:id/safety", async (req, res) => {
       ai_summary: aiSummary,
     });
   } catch (err) {
-    console.error(`[LỖI API GET] P_ID ${propertyId}: ${err.message}`);
+    console.error(`[LỖI API POST] P_ID ${propertyId}: ${err.message}`);
     res.status(500).json({ error: "Lỗi máy chủ nội bộ." });
   }
 });
+// app.post("/api/v1/properties/:id/safety", async (req, res) => {
+//   const propertyId = parseInt(req.params.id, 10);
+//   if (isNaN(propertyId)) {
+//     return res.status(400).json({ error: "ID phòng trọ không hợp lệ." });
+//   }
+//   const { property, nearbyPlaces } = req.body;
+
+//   try {
+//     let result = await pool.query("SELECT * FROM property_safety_scores WHERE property_id = $1", [
+//       propertyId,
+//     ]);
+//     if (result.rowCount === 0) {
+//       try {
+//         await runJob(propertyId);
+//         result = await pool.query("SELECT * FROM property_safety_scores WHERE property_id = $1", [
+//           propertyId,
+//         ]);
+//         if (result.rowCount === 0) {
+//           return res
+//             .status(404)
+//             .json({ error: "Không tìm thấy điểm an toàn. (Job chưa chạy hoặc không có dữ liệu)" });
+//         }
+//       } catch (error) {
+//         console.error(`[LỖI API] Không thể chạy job an toàn: ${error.message}`);
+//       }
+//     }
+
+//     const safetyData = result.rows[0];
+//     const { crime_score, user_score, env_score } = safetyData;
+
+//     // Generate AI summary if scores are available
+//     let aiSummary = null;
+//     if (crime_score !== null && user_score !== null && env_score !== null) {
+//       const crimeScore = parseFloat(crime_score);
+//       const userScore = parseFloat(user_score);
+//       const envScore = parseFloat(env_score);
+
+//       // Fetch reviews for the property
+//       const reviewsResult = await pool.query(
+//         "SELECT safety_rating, cleanliness_rating, amenities_rating, host_rating, review_text FROM reviews WHERE property_id = $1 ORDER BY created_at DESC",
+//         [propertyId]
+//       );
+//       const reviews = reviewsResult.rows;
+
+//       aiSummary = await generateAISummary(
+//         crimeScore,
+//         userScore,
+//         envScore,
+//         property,
+//         nearbyPlaces,
+//         reviews
+//       );
+//     }
+
+//     res.status(200).json({
+//       ...safetyData,
+//       ai_summary: aiSummary,
+//     });
+//   } catch (err) {
+//     console.error(`[LỖI API GET] P_ID ${propertyId}: ${err.message}`);
+//     res.status(500).json({ error: "Lỗi máy chủ nội bộ." });
+//   }
+// });
 
 /**
  * API CHO NGƯỜI DÙNG: Lấy reviews của một property với phân trang
