@@ -76,6 +76,64 @@ router.post("/properties/:id/safety", async (req, res) => {
   }
 });
 
+// --- API SAFETY WIDGET (ĐÃ FIX) ---
+router.get("/properties/:id/safety", async (req, res) => {
+  const propertyId = parseInt(req.params.id, 10);
+  const includeAi = req.query.include_ai === "true";
+
+  try {
+    // 1. Lấy thông tin phòng
+    let propRes = await pool.query("SELECT * FROM properties WHERE id = $1", [propertyId]);
+    if (propRes.rowCount === 0) {
+      // fetch property via BE api
+      await runJob(propertyId);
+      propRes = await pool.query("SELECT * FROM properties WHERE id = $1", [propertyId]);
+      // Still not found after run job
+      if (propRes.rowCount === 0) {
+        return res.status(404).json({ error: "Không tìm thấy phòng trọ." });
+      }
+    }
+
+    const propertyData = propRes.rows[0];
+
+    // Lấy reviews
+    const reviews = await pool.query(
+      "SELECT safety_rating, cleanliness_rating, amenities_rating, host_rating, review_text FROM reviews WHERE property_id = $1 ORDER BY created_at DESC",
+      [propertyId]
+    );
+
+    // 2. Lấy điểm số
+    let scores = await pool.query("SELECT * FROM property_safety_scores WHERE property_id = $1", [
+      propertyId,
+    ]);
+    if (scores.rowCount === 0) {
+      // still no scores even run job
+      return res.status(404).json({ error: "Không tìm thấy dữ liệu an toàn cho phòng trọ này." });
+    }
+
+    // Fallback nếu tính toán lỗi
+    const safetyData = scores.rows[0] || { crime_score: 0, user_score: 0, environment_score: 0 };
+
+    // 3. Logic AI On-demand
+    let aiSummary;
+    if (includeAi && !aiSummary) {
+      aiSummary = await generateAISummary(
+        safetyData.crime_score, // Hàm bên kia sẽ tự ép kiểu Number()
+        safetyData.user_score,
+        safetyData.environment_score,
+        propertyData,
+        [],
+        reviews.rows
+      );
+    }
+
+    res.json({ ...safetyData, ai_summary: aiSummary });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server Error" });
+  }
+});
+
 /**
  * Internal sync property endpoint
  */
