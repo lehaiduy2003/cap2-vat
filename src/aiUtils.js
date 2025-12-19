@@ -1,3 +1,4 @@
+// src/aiUtils.js
 const { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } = require("@google/generative-ai");
 const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, "../.env") });
@@ -16,7 +17,13 @@ const safetySettings = [
 
 async function generateAISummary(crimeScore, userScore, envScore, property, nearbyPlaces, reviews = []) {
   try {
-    // 1. Tối ưu dữ liệu đầu vào (Tránh prompt quá dài gây lỗi)
+    // --- [FIX LỖI QUAN TRỌNG] ÉP KIỂU SỐ AN TOÀN ---
+    // Chuyển mọi input thành số (Number). Nếu null/undefined -> thành 0.
+    const cScore = Number(crimeScore) || 0;
+    const uScore = Number(userScore) || 0;
+    const eScore = Number(envScore) || 0;
+
+    // 1. Tối ưu dữ liệu review đầu vào
     const reviewsText = reviews.slice(0, 5).map(r => 
         `- "${r.review_text ? r.review_text.substring(0, 200) : 'Không có nội dung'}" (${r.safety_rating}/5)`
     ).join("\n");
@@ -25,21 +32,21 @@ async function generateAISummary(crimeScore, userScore, envScore, property, near
       Đóng vai chuyên gia Bất động sản. Hãy viết đoạn nhận xét ngắn gọn (khoảng 150 từ) về độ an toàn của phòng trọ này.
       
       THÔNG TIN:
-      - Tên: ${property.title}
-      - Địa chỉ: ${property.addressDetails || 'Đà Nẵng'}
+      - Tên: ${property.title || 'Phòng trọ'}
+      - Địa chỉ: ${property.addressDetails || property.address || 'Vietnam'}
       
       ĐIỂM SỐ (Thang 10):
-      - An ninh: ${crimeScore.toFixed(1)} (Dựa trên lịch sử sự cố)
-      - Cộng đồng: ${userScore.toFixed(1)} (Dựa trên ${reviews.length} đánh giá)
-      - Tiện ích: ${envScore.toFixed(1)} (Gần trường, trạm xá, đồn CA)
+      - An ninh: ${cScore.toFixed(1)} (Dựa trên lịch sử sự cố)
+      - Cộng đồng: ${uScore.toFixed(1)} (Dựa trên ${reviews.length} đánh giá)
+      - Tiện ích & Môi trường: ${eScore.toFixed(1)} (Gần tiện ích, rủi ro ngập lụt/tiếng ồn)
 
       REVIEW CỦA NGƯỜI THUÊ:
       ${reviewsText}
 
       YÊU CẦU OUTPUT:
       - Định dạng Markdown.
-      - Đi thẳng vào nhận xét ưu/nhược điểm. Không chào hỏi thừa.
-      - Phân tích rủi ro nếu điểm An ninh thấp. Khen ngợi nếu điểm cao.
+      - Đi thẳng vào nhận xét ưu/nhược điểm.
+      - Phân tích rủi ro nếu điểm thấp. Khen ngợi nếu điểm cao.
       - Kết luận: Có nên thuê không?
     `;
 
@@ -47,7 +54,7 @@ async function generateAISummary(crimeScore, userScore, envScore, property, near
       contents: [{ role: "user", parts: [{ text: prompt }] }],
       generationConfig: {
         temperature: 0.7,
-        maxOutputTokens: 3048, // [FIX] Tăng lên 3048 để không bị cắt chữ
+        maxOutputTokens: 3024,
       },
       safetySettings,
     });
@@ -55,7 +62,7 @@ async function generateAISummary(crimeScore, userScore, envScore, property, near
     return result.response.text();
   } catch (err) {
     console.error("[AI ERROR]", err.message);
-    return "Hệ thống AI đang bận, vui lòng thử lại sau.";
+    return "Hệ thống AI đang bận hoặc gặp lỗi xử lý dữ liệu. Vui lòng thử lại sau.";
   }
 }
 

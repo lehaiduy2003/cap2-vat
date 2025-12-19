@@ -67,125 +67,122 @@ router.get("/reviews/:property_id", async (req, res) => {
 });
 
 /**
- * API CHO NGƯỜI DÙNG: Thêm review cho một property
+ * API CHO NGƯỜI DÙNG: Thêm hoặc Sửa review (Upsert)
  */
 router.post("/reviews", userAuth, async (req, res) => {
-  // 1. Lấy dữ liệu từ body (THÊM CÁC TRƯỜNG MỚI)
   const {
     property_id,
     rentHistoryId,
     safety_rating,
-    cleanliness_rating, // <-- MỚI
-    amenities_rating, // <-- MỚI
-    host_rating, // <-- MỚI
+    cleanliness_rating,
+    amenities_rating,
+    host_rating,
     review_text,
   } = req.body;
-  const user_id = req.user_id; // Lấy từ middleware 'userAuth'
+  const user_id = req.user_id;
 
-  // 2. Validate dữ liệu
-  const ratingSa = parseInt(safety_rating, 10);
-  const ratingCl = parseInt(cleanliness_rating, 10); // <-- MỚI
-  const ratingAm = parseInt(amenities_rating, 10); // <-- MỚI
-  const ratingHo = parseInt(host_rating, 10); // <-- MỚI
   const propId = parseInt(property_id, 10);
-
-  // Validate tất cả các trường 1-5 sao
-  const allRatings = [ratingSa, ratingCl, ratingAm, ratingHo];
-  if (isNaN(propId) || allRatings.some((r) => isNaN(r) || r < 1 || r > 5)) {
-    return res.status(400).json({
-      error: 'Dữ liệu không hợp lệ. "property_id" và tất cả các mục 1-5 sao là bắt buộc.',
-    });
+  if (isNaN(propId)) {
+    return res.status(400).json({ error: "ID phòng trọ không hợp lệ." });
   }
 
-  // 2.5. Kiểm tra xem property có tồn tại không
-  try {
-    const propertyCheck = await pool.query("SELECT id FROM properties WHERE id = $1", [propId]);
-    if (propertyCheck.rowCount === 0) {
-      try {
-        // Kích hoạt tính điểm lại ngay cho phòng này
-        await runJob(propId);
-      } catch (syncError) {
-        return res.status(404).json({
-          error: "Phòng trọ không tồn tại hoặc không thể đồng bộ.",
-        });
-      }
-    }
-  } catch (err) {
-    console.error("[LỖI CHECK PROPERTY]", err.message);
-    return res.status(500).json({ error: "Lỗi máy chủ nội bộ khi kiểm tra phòng trọ." });
-  }
-
-  // 3. INSERT vào CSDL (CẬP NHẬT QUERY)
   try {
     const query = {
       text: `
                 INSERT INTO reviews (
                     property_id, user_id, safety_rating, review_text, created_at,
-                    cleanliness_rating, amenities_rating, host_rating -- <-- CỘT MỚI
+                    cleanliness_rating, amenities_rating, host_rating
                 )
-                VALUES ($1, $2, $3, $4, NOW(), $5, $6, $7) -- <-- VALUES MỚI
+                VALUES ($1, $2, $3, $4, NOW(), $5, $6, $7)
                 ON CONFLICT (property_id, user_id)
                 DO UPDATE SET
                     safety_rating = EXCLUDED.safety_rating,
                     review_text = EXCLUDED.review_text,
                     created_at = NOW(),
-                    cleanliness_rating = EXCLUDED.cleanliness_rating, -- <-- CẬP NHẬT MỚI
-                    amenities_rating = EXCLUDED.amenities_rating,     -- <-- CẬP NHẬT MỚI
-                    host_rating = EXCLUDED.host_rating                -- <-- CẬP NHẬT MỚI
+                    cleanliness_rating = EXCLUDED.cleanliness_rating,
+                    amenities_rating = EXCLUDED.amenities_rating,
+                    host_rating = EXCLUDED.host_rating
                 RETURNING *;
             `,
       values: [
         propId,
         user_id,
-        ratingSa,
+        parseInt(safety_rating) || 5,
         review_text || null,
-        ratingCl,
-        ratingAm,
-        ratingHo, // <-- THAM SỐ MỚI
+        parseInt(cleanliness_rating) || 5,
+        parseInt(amenities_rating) || 5,
+        parseInt(host_rating) || 5,
       ],
     };
 
     const result = await pool.query(query);
     const newReview = result.rows[0];
 
-    try {
-      const BASE_API_URL = process.env.BASE_API_URL; // URL Java Core
-      const patchResponse = await fetch(
-        `${BASE_API_URL}/api/rent-histories/reviews/${rentHistoryId}`,
-        {
-          method: "PATCH",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: req.headers.authorization, // Forward the auth token
-          },
-        }
-      );
-      if (!patchResponse.ok) {
+    // Cập nhật bên Java Core (nếu có rentHistoryId)
+    if (rentHistoryId && rentHistoryId !== "undefined" && rentHistoryId !== "null") {
+      try {
+        const BASE_API_URL = process.env.BASE_API_URL;
+        await fetch(
+          `${BASE_API_URL}/api/rent-histories/reviews/${rentHistoryId}`,
+          {
+            method: "PATCH",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: req.headers.authorization,
+            },
+          }
+        );
+      } catch (patchError) {
         console.error(
-          `[PATCH FAILED] Không thể cập nhật rent history ${rentHistoryId}: ${patchResponse.status}`
+          `[PATCH ERROR] Lỗi khi cập nhật rent history ${rentHistoryId}:`,
+          patchError.message
         );
       }
-    } catch (patchError) {
-      console.error(
-        `[PATCH ERROR] Lỗi khi cập nhật rent history ${rentHistoryId}:`,
-        patchError.message
-      );
     }
 
-    // 4. Phản hồi cho User ngay lập tức
-    res.status(201).json(newReview);
-
-    // 5. [TỐI ƯU] Kích hoạt tính toán lại điểm (KHÔNG THAY ĐỔI)
-    // Job này vẫn chỉ quan tâm 'safety_rating'.
+    // Trigger tính lại điểm
     runJob(propId).catch((err) => {
       console.error(`[JOB-RECALC] Lỗi tính lại điểm cho P_ID ${propId}:`, err);
     });
+
+    res.status(201).json(newReview);
   } catch (err) {
     console.error("[LỖI API POST]", err.message);
-    if (err.code === "23505") {
-      return res.status(409).json({ error: "Bạn đã review phòng trọ này rồi." });
-    }
     res.status(500).json({ error: "Lỗi máy chủ nội bộ khi thêm review." });
+  }
+});
+
+/**
+ * API MỚI (BẠN ĐANG THIẾU): Xóa review của chính mình
+ */
+router.delete("/reviews/:property_id", userAuth, async (req, res) => {
+  const propertyId = parseInt(req.params.property_id, 10);
+  const userId = req.user_id;
+
+  if (isNaN(propertyId)) {
+    return res.status(400).json({ error: "ID phòng trọ không hợp lệ." });
+  }
+
+  try {
+    // Xóa review khớp cả PropertyID và UserID (chỉ xóa của chính mình)
+    const result = await pool.query(
+      "DELETE FROM reviews WHERE property_id = $1 AND user_id = $2 RETURNING *",
+      [propertyId, userId]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Không tìm thấy đánh giá của bạn để xóa." });
+    }
+
+    // Trigger tính lại điểm an toàn sau khi xóa
+    runJob(propertyId).catch((err) => {
+      console.error(`[JOB-DELETE] Lỗi tính lại điểm ID ${propertyId}:`, err);
+    });
+
+    res.status(200).json({ message: "Đã xóa đánh giá thành công." });
+  } catch (err) {
+    console.error(`[API DELETE REVIEW] Lỗi: ${err.message}`);
+    res.status(500).json({ error: "Lỗi máy chủ nội bộ." });
   }
 });
 
